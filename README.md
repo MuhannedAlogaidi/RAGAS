@@ -2,6 +2,8 @@
 
 > **One sentence:** Build a small RAG system over a product catalog, then measure exactly how well it performs using RAGAS across 5 metrics — and deploy it confidently on Streamlit Cloud.
 
+> 🚀 **Live demo:** [ragasz.streamlit.app](https://ragasz.streamlit.app/)
+
 ---
 
 ## What Are Evals and Why Do They Matter?
@@ -112,10 +114,27 @@ A Streamlit app that runs a **real** RAG pipeline over a TechNest product catalo
 
 ```mermaid
 flowchart LR
-    Q([Customer Question]) --> R[Retriever\nCosine similarity\nsentence-transformers]
+    Q([Customer Question]) --> R[Retriever\nCosine similarity\nGemini embeddings]
     R --> |Top 3 chunks| G[Generator\nGroq llama-3.3-70b]
     G --> A([Answer])
     DB[(catalog.json\n15 entries)] --> R
+    GEM[Gemini API\ngemini-embedding-2] --> R
+```
+
+**How retrieval works:**
+
+```mermaid
+flowchart LR
+    subgraph Startup["Index time — once"]
+        C[catalog.json\n15 entries] --> GE1[Gemini embed_documents]
+        GE1 --> M[15x768 numpy matrix\ncached in Retriever]
+    end
+    subgraph Query["Query time — per golden"]
+        Q2[user question] --> GE2[Gemini embed_query]
+        GE2 --> CS[Cosine similarity\nvs cached matrix]
+        CS --> TOP[Top-3 content chunks]
+    end
+    M --> CS
 ```
 
 ### The Evaluation Pipeline
@@ -203,20 +222,36 @@ flowchart TD
 
 ### The 5 Fixes
 
-#### Fix 1 — Use `asyncio.run()` instead of `get_event_loop()`
+#### Fix 1 — Run async code in a worker thread, never touch Streamlit's event loop
 
 ```python
-# ❌ BEFORE — breaks on Streamlit Cloud
-def _run(coro):
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coro)
+# ❌ BEFORE — nest_asyncio.apply() patches asyncio globally
+# Breaks Streamlit's anyio loop on Python 3.12+ → NoEventLoopError
+import nest_asyncio
+nest_asyncio.apply()
 
-# ✅ AFTER — works everywhere with nest_asyncio applied
+# ✅ AFTER — isolated worker thread owns its own fresh event loop
 def _run(coro):
-    return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result(timeout=1800)
 ```
 
-`asyncio.run()` always creates a fresh event loop. Combined with `nest_asyncio.apply()` at startup, it works reliably on every platform — local Windows, local Mac, and Streamlit Cloud Linux.
+The worker thread creates its own `asyncio.run()` event loop. Streamlit's internal `anyio` loop is never touched. The main thread simply blocks on `future.result()` until the work is done.
+
+**Rule:** nothing inside the worker thread (inside `_run()`) can call `st.*`. All UI updates — `st.success()`, `st.progress()` — happen in the main thread after `_run()` returns.
+
+```mermaid
+sequenceDiagram
+    participant Main as Main Thread (Streamlit)
+    participant Worker as Worker Thread
+
+    Main->>Worker: executor.submit(asyncio.run, coro)
+    Note over Main: blocks on future.result()
+    Worker->>Worker: asyncio.run(coro) — NO st.* calls
+    Worker-->>Main: return result
+    Main->>Main: st.success() / st.progress() ✅
+```
 
 ---
 
@@ -254,7 +289,7 @@ flowchart LR
 
 #### Fix 4 — Surface errors in the UI instead of hiding them
 
-Every scoring call now has an `error_callback`. When a sample fails (rate limit, timeout, or any other API error), the error message is collected and shown as a visible warning in the app — not silently swallowed.
+Every scoring call now uses an `error_collector` (a plain Python list). When a sample fails (rate limit, timeout, or any other API error), the error is appended to the list inside the worker thread, then displayed as a visible warning in the main thread — not silently swallowed.
 
 ```
 Before: sample 3 fails silently → score = None → Results tab shows ⬜ N/A → no idea why
@@ -275,8 +310,8 @@ The Results tab no longer waits for all 5 experiments to finish. It shows whatev
 
 | File | What changed |
 |------|-------------|
-| `app.py` | `_run()` uses `asyncio.run()` — checkpoint save after every experiment — sidebar restore button — skip completed experiments on resume — partial results shown live — errors displayed as warnings |
-| `evals/metrics.py` | `_score_one()` accepts `error_callback` — errors are named and passed to caller instead of silently returning `None` — retry logic is the same but now visible |
+| `app.py` | `_run()` uses `ThreadPoolExecutor` — checkpoint save after every experiment — sidebar restore button — skip completed experiments on resume — partial results shown live — errors displayed as warnings |
+| `evals/metrics.py` | `_score_one()` accepts `error_collector` list — errors appended and surfaced instead of silently returning `None` — retry logic visible in UI |
 
 ---
 
@@ -295,7 +330,7 @@ DMT delete it/
 │
 ├── rag/                       ← RAG pipeline modules
 │   ├── loader.py              ← load catalog.json and goldens.json
-│   ├── retriever.py           ← embed catalog, cosine similarity, return top-k chunks
+│   ├── retriever.py           ← Gemini embeddings, cosine similarity, return top-k chunks
 │   └── generator.py          ← call Groq LLM, return answer string
 │
 ├── evals/                     ← Evaluation modules
@@ -303,13 +338,25 @@ DMT delete it/
 │   ├── metrics.py             ← Phase 2: RAGAS scoring with cooldowns + retry + error surfacing
 │   └── reporter.py            ← build results dict, save JSON, print summary
 │
+├── svgs/                      ← Flow diagrams for every micro-workflow (10 SVGs)
+│   ├── 01_system_overview.svg
+│   ├── 02_rag_retrieval.svg
+│   ├── 03_rag_generation.svg
+│   ├── 04_phase1_pipeline.svg
+│   ├── 05_phase2_evaluation.svg
+│   ├── 06_thread_safety.svg
+│   ├── 07_rate_limit_strategy.svg
+│   ├── 08_checkpoint_recovery.svg
+│   ├── 09_ragas_metrics.svg
+│   └── 10_byok_sidebar.svg
+│
 ├── checkpoint.json            ← auto-created during a run, safe to delete
 ├── results.json               ← final eval results (created after Phase 2 completes)
 │
 ├── EVALS.md                   ← Deep-dive reference: all metrics explained
 ├── README.md                  ← this file
 ├── requirements.txt
-└── .env                       ← GROQ_API_KEY, JUDGE_GROQ (never committed)
+└── .env                       ← GROQ_API_KEY, JUDGE_GROQ, GEMINI_API_KEY (never committed)
 ```
 
 ### Module Responsibilities
@@ -319,7 +366,7 @@ flowchart LR
     app([app.py\nStreamlit UI\n+ checkpoint logic])
 
     app --> loader[rag/loader.py\nload JSON files]
-    app --> retriever[rag/retriever.py\nsentence-transformers\ncosine similarity]
+    app --> retriever[rag/retriever.py\nGemini embeddings\ncosine similarity]
     app --> generator[rag/generator.py\nGroq generation]
     app --> runner[evals/runner.py\nPhase 1 orchestration]
     app --> metrics[evals/metrics.py\nRАGAS scoring\nrate limit + error handling]
@@ -350,9 +397,15 @@ pip install -r requirements.txt
 ```
 GROQ_API_KEY=<your main Groq key>
 JUDGE_GROQ=<second Groq key — used only for RAGAS judge calls>
+GEMINI_API_KEY=<your Google AI Studio key>
 ```
 
-> **Why two keys?** The RAG generator uses `GROQ_API_KEY`. RAGAS uses `JUDGE_GROQ`. Keeping them separate means a long eval run can never exhaust your production key. If `JUDGE_GROQ` is not set, the app falls back to `GROQ_API_KEY` automatically.
+> **Why three keys?**
+> - `GROQ_API_KEY` — RAG generator (`llama-3.3-70b-versatile`)
+> - `JUDGE_GROQ` — RAGAS judge LLM (`llama-3.1-8b-instant`). Keeping it separate means eval can never exhaust your main key. Falls back to `GROQ_API_KEY` if blank.
+> - `GEMINI_API_KEY` — Gemini retrieval embeddings (`gemini-embedding-2-preview`). Free key at [aistudio.google.com](https://aistudio.google.com).
+
+On Streamlit Cloud, enter these keys in the **BYOK sidebar** — they are stored in the browser session only, never on disk.
 
 ### 3. Run the notebook (Part 1)
 
