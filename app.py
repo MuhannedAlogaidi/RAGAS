@@ -287,25 +287,13 @@ with tab_pipeline:
         generator = Generator(api_key=st.session_state.groq_key)
         goldens = load_goldens()
 
-        progress = st.progress(0, text="Starting…")
-        log = st.empty()
-        lines = []
+        # _run() executes in a worker thread — no st.* calls inside
+        with st.spinner(f"Running RAG on {len(goldens)} goldens (5s spacing)…"):
+            enriched = _run(run_phase1(goldens, retriever, generator))
 
-        def phase1_cb(i, question):
-            lines.append(f"[{i+1}/{len(goldens)}] {question[:60]}…")
-            log.code("\n".join(lines))
-            progress.progress((i + 1) / len(goldens), text=f"Processing {i+1}/{len(goldens)}…")
-
-        with st.spinner("Running RAG on 5 goldens (5s spacing between calls)…"):
-            enriched = _run(
-                run_phase1(goldens, retriever, generator, status_callback=phase1_cb)
-            )
-
-        progress.progress(1.0, text="Phase 1 complete ✅")
+        # Back in main thread — safe to call st.* here
         st.session_state.enriched = enriched
         st.session_state.phase1_done = True
-
-        # Save checkpoint so Phase 1 results survive a connection drop
         save_checkpoint(enriched, {}, {}, True, False)
         st.success(f"✅ Phase 1 done — {len(enriched)} responses generated.")
 
@@ -358,7 +346,6 @@ with tab_pipeline:
             enriched = st.session_state.enriched
             judge_llm = build_judge(st.session_state.judge_key)
             ragas_emb = get_ragas_embeddings()
-
             total_experiments = len(EXPERIMENTS)
             overall_progress = st.progress(
                 len(already_done) / total_experiments,
@@ -367,7 +354,6 @@ with tab_pipeline:
 
             for exp_idx, (name, factory, keys) in enumerate(EXPERIMENTS):
 
-                # Skip already-completed experiments (resume from checkpoint)
                 if name in st.session_state.scores:
                     overall_progress.progress(
                         (exp_idx + 1) / total_experiments,
@@ -375,64 +361,34 @@ with tab_pipeline:
                     )
                     continue
 
-                st.markdown(
-                    f"**[{exp_idx+1}/{total_experiments}] {name}** "
-                    f"— {len(enriched)} samples, {SAMPLE_COOLDOWN}s between each"
-                )
+                # ── All st.* calls here are in the main thread ── ✅
+                st.markdown(f"**[{exp_idx+1}/{total_experiments}] {name}**")
 
                 metric = factory(judge_llm, ragas_emb)
                 inputs = prepare_inputs(enriched, keys)
+                exp_errors = []  # plain list — appended to inside the worker thread
 
-                # FIX 4: Collect errors per sample so they are visible in the UI
-                exp_errors = []
-                sample_lines = []
-                sample_log = st.empty()
-
-                def make_status_cb(log_ref, lines_ref):
-                    def cb(i, total):
-                        lines_ref.append(f"  [{i+1}/{total}] scoring…")
-                        log_ref.code("\n".join(lines_ref[-10:]))
-                    return cb
-
-                def make_error_cb(errors_list, log_ref, lines_ref):
-                    def cb(i, msg):
-                        errors_list.append({"sample": i + 1, "error": msg})
-                        lines_ref.append(f"  ⚠️  sample {i+1} error: {msg[:80]}")
-                        log_ref.code("\n".join(lines_ref[-10:]))
-                    return cb
-
-                scores = _run(
-                    score_experiment(
-                        metric,
-                        inputs,
-                        status_callback=make_status_cb(sample_log, sample_lines),
-                        error_callback=make_error_cb(exp_errors, sample_log, sample_lines),
+                # _run() blocks until the experiment finishes — no st.* inside
+                with st.spinner(f"Scoring {len(inputs)} samples for {name}…"):
+                    scores = _run(
+                        score_experiment(metric, inputs, error_collector=exp_errors)
                     )
-                )
 
-                # FIX 5: Persist scores to session state immediately after each experiment
+                # ── Back in main thread — safe to update UI ── ✅
                 st.session_state.scores[name] = scores
                 st.session_state.errors[name] = exp_errors
+                save_checkpoint(enriched, st.session_state.scores, st.session_state.errors, True, False)
 
-                # FIX 2: Save checkpoint to disk right away
-                save_checkpoint(
-                    enriched,
-                    st.session_state.scores,
-                    st.session_state.errors,
-                    True,
-                    False,
-                )
-
-                # Show result summary with error count
                 avg = _avg(scores)
                 null_count = sum(1 for s in scores if s is None)
-                result_line = f"✅ **{name}**: {_badge(avg)} {avg:.2f}" if avg is not None else f"❌ **{name}**: all samples failed"
-                if null_count:
-                    result_line += f"  ⚠️ {null_count}/{len(scores)} sample(s) failed"
-                sample_lines.append(result_line)
-                sample_log.code("\n".join(sample_lines[-10:]))
+                if avg is not None:
+                    msg = f"✅ **{name}**: {_badge(avg)} {avg:.2f}"
+                    if null_count:
+                        msg += f"  ⚠️ {null_count}/{len(scores)} failed"
+                    st.success(msg)
+                else:
+                    st.error(f"❌ **{name}**: all samples failed to score")
 
-                # Show per-sample errors as warnings
                 if exp_errors:
                     with st.expander(f"⚠️ {len(exp_errors)} error(s) in {name}"):
                         for err in exp_errors:
@@ -443,34 +399,21 @@ with tab_pipeline:
                     text=f"Completed {exp_idx+1}/{total_experiments} experiments",
                 )
 
-                # Countdown between experiments
+                # Cooldown between experiments — time.sleep is fine in main thread
                 if exp_idx < total_experiments - 1:
                     next_name = EXPERIMENTS[exp_idx + 1][0]
                     if next_name not in st.session_state.scores:
                         countdown = st.empty()
                         for remaining_secs in range(EXPERIMENT_COOLDOWN, 0, -1):
-                            countdown.info(
-                                f"⏳ Cooldown before **{next_name}**: "
-                                f"**{remaining_secs}s** remaining…"
-                            )
+                            countdown.info(f"⏳ Cooldown before **{next_name}**: **{remaining_secs}s**…")
                             time.sleep(1)
                         countdown.empty()
 
-            # All experiments done
             overall_progress.progress(1.0, text="Phase 2 complete ✅")
-
             st.session_state.results = build_results(enriched, st.session_state.scores)
             st.session_state.phase2_done = True
-
-            save_checkpoint(
-                enriched,
-                st.session_state.scores,
-                st.session_state.errors,
-                True,
-                True,
-            )
+            save_checkpoint(enriched, st.session_state.scores, st.session_state.errors, True, True)
             save_results(RESULTS_PATH, st.session_state.results)
-
             st.success("✅ Phase 2 complete — results saved to results.json")
             st.balloons()
 

@@ -9,21 +9,16 @@ async def run_phase1(
     generator: Generator,
     top_k: int = 3,
     spacing_s: int = 5,
-    status_callback=None,
 ) -> list[dict]:
     """
     Phase 1: run the RAG pipeline on every golden.
     Returns enriched list with retrieved_contexts and response added.
+    No Streamlit calls — safe to run inside a ThreadPoolExecutor worker thread.
     """
     enriched = []
-
     for i, golden in enumerate(goldens):
-        if status_callback:
-            status_callback(i, golden["user_input"])
-
         contexts = retriever.retrieve(golden["user_input"], top_k=top_k)
         response = await generator.generate(golden["user_input"], contexts)
-
         enriched.append(
             {
                 **golden,
@@ -31,8 +26,6 @@ async def run_phase1(
                 "response": response,
             }
         )
-
         if i < len(goldens) - 1:
             await asyncio.sleep(spacing_s)
-
     return enriched

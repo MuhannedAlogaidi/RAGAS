@@ -78,13 +78,13 @@ def prepare_inputs(enriched: list[dict], keys: list[str]) -> list[dict]:
 async def _score_one(
     metric,
     input_dict: dict,
-    error_callback=None,
+    error_collector: list | None = None,
     sample_idx: int = 0,
 ) -> float | None:
     """
     Score a single sample. Returns None on failure.
-    Calls error_callback(sample_idx, error_message) so callers can surface the error.
-    Retries once after RETRY_WAIT seconds on rate-limit (429) errors.
+    Appends error dicts to error_collector (a plain list) — never calls Streamlit,
+    so it is safe to run inside a ThreadPoolExecutor worker thread.
     """
     try:
         results = await metric.abatch_score([input_dict])
@@ -100,48 +100,38 @@ async def _score_one(
         )
 
         if is_rate_limit:
-            if error_callback:
-                error_callback(sample_idx, f"Rate limit hit — waiting {RETRY_WAIT}s then retrying…")
+            if error_collector is not None:
+                error_collector.append({"sample": sample_idx + 1, "error": f"Rate limit — waiting {RETRY_WAIT}s then retrying…"})
             await asyncio.sleep(RETRY_WAIT)
             try:
                 results = await metric.abatch_score([input_dict])
                 return float(results[0].value)
             except Exception as e2:
-                msg = f"Retry also failed: {str(e2)[:120]}"
-                if error_callback:
-                    error_callback(sample_idx, msg)
+                if error_collector is not None:
+                    error_collector.append({"sample": sample_idx + 1, "error": f"Retry failed: {str(e2)[:120]}"})
                 return None
 
-        # Any other error (timeout, connection error, bad response, etc.)
-        msg = f"{type(e).__name__}: {err_str[:120]}"
-        if error_callback:
-            error_callback(sample_idx, msg)
+        if error_collector is not None:
+            error_collector.append({"sample": sample_idx + 1, "error": f"{type(e).__name__}: {err_str[:120]}"})
         return None
 
 
 async def score_experiment(
     metric,
     inputs: list[dict],
-    status_callback=None,
-    error_callback=None,
+    error_collector: list | None = None,
 ) -> list[float | None]:
     """
     Score one metric across all samples, one at a time with SAMPLE_COOLDOWN between each.
-
-    status_callback(i, total)  — called before scoring each sample
-    error_callback(i, msg)     — called when a sample fails to score
+    error_collector is a plain list that gets appended to on failure — no Streamlit calls,
+    safe to run inside a worker thread.
     """
     scores = []
     for i, inp in enumerate(inputs):
-        if status_callback:
-            status_callback(i, len(inputs))
-
-        score = await _score_one(metric, inp, error_callback=error_callback, sample_idx=i)
+        score = await _score_one(metric, inp, error_collector=error_collector, sample_idx=i)
         scores.append(score)
-
         if i < len(inputs) - 1:
             await asyncio.sleep(SAMPLE_COOLDOWN)
-
     return scores
 
 
