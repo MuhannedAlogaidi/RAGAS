@@ -15,7 +15,7 @@ pydantic==2.13.4
 # --- EVALS ---
 ragas
 openai
-sentence-transformers  # notebook + RAGAS eval embeddings only (not used for retrieval in app.py)
+# sentence-transformers  # notebook + RAGAS eval embeddings only (not used for retrieval in app.py)
 
 # --- OBSERVABILITY ---
 langsmith==0.8.3
